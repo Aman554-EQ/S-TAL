@@ -57,27 +57,45 @@ class RingMemory(nn.Module):
             current_segment: (seg_len, B, D) — encoded current window
             video_names:     list of B strings  (optional, for cross-video reset)
         Returns:
-            memory_feats: (memory_len * seg_len // gap + seg_len // gap, B, D)
+            memory_feats: ((mem*seg//gap + seg_len//gap), B, D)
         """
         B = current_segment.shape[1]
         device = current_segment.device
 
+        # Initialise queue on first call
         if self.queue is None:
             self.reset(B, device)
 
-        # Reset memory for any video that changed
+        # ── Batch-size mismatch guard ─────────────────────────────────
+        # The last mini-batch of an epoch is often smaller than earlier
+        # batches (drop_last=False). The stored queue has the old (larger)
+        # batch dimension, so we trim / pad before concatenating.
+        Q_B = self.queue.shape[1]
+        if Q_B != B:
+            if Q_B > B:
+                # Trim — typical case: last batch is smaller
+                self.queue = self.queue[:, :B, :].contiguous()
+            else:
+                # Pad with zeros — rare (should not normally happen)
+                pad = torch.zeros(
+                    self.queue.shape[0], B - Q_B, self.emb_dim,
+                    device=device
+                )
+                self.queue = torch.cat([self.queue, pad], dim=1)
+
+        # ── Reset memory for videos that changed ──────────────────────
         if video_names is not None and self.cur_video is not None:
             for b, name in enumerate(video_names):
                 if b < B and self.cur_video[b] != name:
                     self.queue[:, b, :] = 0.0
 
-        # Shift queue and push current segment
+        # ── Shift queue left by seg_len and append current segment ─────
         seg = current_segment.detach()
         self.queue = torch.cat(
             [self.queue[self.seg_len:], seg], dim=0
         )                                               # (memory_len*seg_len, B, D)
 
-        # Gap-sample for efficiency
+        # ── Gap-sample for efficiency ─────────────────────────────────
         memory_feats = torch.cat(
             [self.queue[::self.gap], seg], dim=0
         )                                               # ((mem*seg//gap + seg), B, D)
@@ -195,7 +213,8 @@ class MYNET(nn.Module):
         self.pos_enc = PositionalEncoding(n_embedding_dim, dropout, maxlen=400)
         self.encoder = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(d_model=n_embedding_dim, nhead=n_enc_head,
-                                       dropout=dropout, activation='gelu'),
+                                       dropout=dropout, activation='gelu',
+                                       batch_first=False),
             n_enc_layer, nn.LayerNorm(n_embedding_dim)
         )
 

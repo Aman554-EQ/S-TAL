@@ -10,6 +10,7 @@ import opts_thumos as opts
 import time
 import h5py
 from functools import partial
+from tqdm import tqdm
 from iou_utils import *
 from eval import evaluation_detection
 from tensorboardX import SummaryWriter
@@ -17,6 +18,36 @@ from dataset import VideoDataSet
 from models import MYNET, SuppressNet
 from loss_func import (AdaptiveFocalLoss, cls_loss_func,
                        regress_loss_func, suppress_loss_func)
+
+
+# ---------------------------------------------------------------------------
+# JSON-safe cast: numpy scalars / arrays are not serialisable by default
+# ---------------------------------------------------------------------------
+def _to_py(x):
+    """Recursively cast numpy scalars/arrays to native Python types."""
+    if isinstance(x, (np.floating, np.float32, np.float64)):
+        return float(x)
+    if isinstance(x, (np.integer, np.int32, np.int64)):
+        return int(x)
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    if isinstance(x, list):
+        return [_to_py(v) for v in x]
+    if isinstance(x, dict):
+        return {k: _to_py(v) for k, v in x.items()}
+    return x
+
+
+class _NumpyEncoder(json.JSONEncoder):
+    """Drop-in JSONEncoder that handles all numpy scalar/array types."""
+    def default(self, obj):
+        if isinstance(obj, (np.floating, np.float32, np.float64)):
+            return float(obj)
+        if isinstance(obj, (np.integer, np.int32, np.int64)):
+            return int(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
 
 
 # ---------------------------------------------------------------------------
@@ -83,13 +114,23 @@ def train_one_epoch(opt, model, train_dataset, optimizer,
         train_dataset, batch_size=opt['batch_size'], shuffle=True,
         num_workers=0, pin_memory=True, drop_last=False
     )
+
+    # ── Reset ring memory at epoch start (via raw model ref) ─────────
+    # Shuffled batches have no temporal continuity, so carrying memory
+    # across epochs is semantically wrong and causes batch-size crashes.
+    raw = model.module if isinstance(model, torch.nn.DataParallel) else model
+    raw.ring_memory.queue     = None
+    raw.ring_memory.cur_video = None
     epoch_cost      = 0.0
     epoch_cost_cls  = 0.0
     epoch_cost_reg  = 0.0
     epoch_cost_snip = 0.0
     total_iter = max(1, len(train_dataset) // opt['batch_size'])
 
-    for n_iter, (input_data, cls_label, reg_label, snip_label) in enumerate(train_loader):
+    pbar = tqdm(train_loader, desc="  Train", leave=True,
+                bar_format="{l_bar}{bar:30}{r_bar}")
+
+    for n_iter, (input_data, cls_label, reg_label, snip_label) in enumerate(pbar):
         if warmup:
             for g in optimizer.param_groups:
                 g['lr'] = (n_iter + 1) * opt['lr'] / total_iter
@@ -124,9 +165,17 @@ def train_one_epoch(opt, model, train_dataset, optimizer,
 
         optimizer.zero_grad()
         cost.backward()
-        # Gradient clipping for stability
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+
+        # ── Real-time per-batch display ────────────────────────────────
+        pbar.set_postfix({
+            'loss': f"{cost.item():.4f}",
+            'cls':  f"{cost_cls.item():.4f}",
+            'reg':  f"{cost_reg.item():.4f}",
+            'snip': f"{cost_snip.item():.4f}",
+            'lr':   f"{optimizer.param_groups[-1]['lr']:.1e}",
+        })
 
     return n_iter, epoch_cost, epoch_cost_cls, epoch_cost_reg, epoch_cost_snip
 
@@ -145,7 +194,7 @@ def eval_one_epoch(opt, model, test_dataset):
     output_dict = {"version": "VERSION 1.3", "results": result_dict,
                    "external_data": {}}
     with open(opt['result_file'], 'w') as f:
-        json.dump(output_dict, f, indent=2)
+        json.dump(output_dict, f, indent=2, cls=_NumpyEncoder)
 
     IoUmAP  = evaluation_detection(opt, verbose=False)
     IoUmAP_5 = sum(IoUmAP) / len(IoUmAP)
@@ -157,12 +206,24 @@ def eval_one_epoch(opt, model, test_dataset):
 # ---------------------------------------------------------------------------
 def train(opt):
     writer = SummaryWriter()
-    model  = MYNET(opt).cuda()
+
+    # ── Build model, optionally wrap with DataParallel ─────────────────
+    _n_gpus = torch.cuda.device_count()
+    raw_model = MYNET(opt).cuda()          # always keep the unwrapped ref
+    if _n_gpus > 1:
+        tqdm.write(f"\n🚀  Using {_n_gpus} GPUs with nn.DataParallel")
+        model = torch.nn.DataParallel(raw_model)
+        # Double batch size to fully utilise both GPUs
+        opt = dict(opt)                    # shallow copy so original unchanged
+        opt['batch_size'] = opt['batch_size'] * _n_gpus
+    else:
+        tqdm.write("\nℹ️  Single GPU detected")
+        model = raw_model
 
     # ── Differential LR: history unit gets a much lower LR ────────────
-    hist_params  = list(model.history_unit.parameters())
+    hist_params  = list(raw_model.history_unit.parameters())
     hist_ids     = set(id(p) for p in hist_params)
-    other_params = [p for p in model.parameters() if id(p) not in hist_ids]
+    other_params = [p for p in raw_model.parameters() if id(p) not in hist_ids]
 
     optimizer = optim.Adam([
         {'params': hist_params,  'lr': opt.get('lr_hist', 1e-6)},
@@ -191,27 +252,28 @@ def train(opt):
     train_dataset = VideoDataSet(opt, subset='train')
     test_dataset  = VideoDataSet(opt, subset=opt['inference_subset'])
 
-    for n_epoch in range(opt['epoch']):
+    epoch_bar = tqdm(range(opt['epoch']), desc="Epochs", unit="ep",
+                     bar_format="{l_bar}{bar:20}{r_bar}")
+
+    for n_epoch in epoch_bar:
         warmup = (n_epoch == 0)
 
+        # ── Train ──────────────────────────────────────────────────────
+        model.train()
         (n_iter, epoch_cost, epoch_cost_cls,
          epoch_cost_reg, epoch_cost_snip) = train_one_epoch(
             opt, model, train_dataset, optimizer,
             cls_loss_fn, snip_loss_fn, warmup
         )
+        avg_loss     = epoch_cost      / (n_iter + 1)
+        avg_cls      = epoch_cost_cls  / (n_iter + 1)
+        avg_reg      = epoch_cost_reg  / (n_iter + 1)
+        avg_snip     = epoch_cost_snip / (n_iter + 1)
+        cur_lr       = optimizer.param_groups[-1]['lr']
 
-        writer.add_scalars('data/cost', {'train': epoch_cost / (n_iter + 1)}, n_epoch)
-        print(
-            "Epoch [%d] loss=%.4f  cls=%.4f  reg=%.4f  snip=%.4f  lr=%.2e" % (
-                n_epoch,
-                epoch_cost      / (n_iter + 1),
-                epoch_cost_cls  / (n_iter + 1),
-                epoch_cost_reg  / (n_iter + 1),
-                epoch_cost_snip / (n_iter + 1),
-                optimizer.param_groups[-1]['lr']
-            )
-        )
+        writer.add_scalars('data/cost', {'train': avg_loss}, n_epoch)
 
+        # ── Eval ───────────────────────────────────────────────────────
         scheduler.step()
         model.eval()
         with torch.no_grad():
@@ -219,19 +281,35 @@ def train(opt):
                 opt, model, test_dataset
             )
         writer.add_scalars('data/mAP', {'test': IoUmAP_5}, n_epoch)
-        print("Epoch [%d] eval_loss=%.4f  cls=%.4f  reg=%.4f  mAP=%.4f" % (
-            n_epoch, tot_loss, cls_loss, reg_loss, IoUmAP_5))
 
-        state = {'epoch': n_epoch + 1, 'state_dict': model.state_dict()}
+        # ── Checkpoint ─────────────────────────────────────────────────
+        # Always save raw_model.state_dict() — no 'module.' prefix,
+        # so checkpoints load cleanly on any number of GPUs.
+        state = {'epoch': n_epoch + 1, 'state_dict': raw_model.state_dict()}
         torch.save(state, opt['checkpoint_path'] + '/checkpoint.pth.tar')
-        if IoUmAP_5 > model.best_map:
-            model.best_map = IoUmAP_5
+        is_best = IoUmAP_5 > raw_model.best_map
+        if is_best:
+            raw_model.best_map = IoUmAP_5
             torch.save(state, opt['checkpoint_path'] + '/ckp_best.pth.tar')
 
-        model.train()
+        # ── Live summary on the epoch bar ──────────────────────────────
+        epoch_bar.set_postfix({
+            'loss':  f"{avg_loss:.4f}",
+            'cls':   f"{avg_cls:.4f}",
+            'reg':   f"{avg_reg:.4f}",
+            'snip':  f"{avg_snip:.4f}",
+            'eloss': f"{tot_loss:.4f}",
+            'mAP':   f"{IoUmAP_5:.4f}" + (" ✓best" if is_best else ""),
+            'lr':    f"{cur_lr:.1e}",
+        })
+        tqdm.write(
+            f"[Epoch {n_epoch:02d}] "
+            f"train={avg_loss:.4f}  cls={avg_cls:.4f}  reg={avg_reg:.4f}  snip={avg_snip:.4f} | "
+            f"eval={tot_loss:.4f}  mAP={IoUmAP_5:.4f}{'  ← best' if is_best else ''}  lr={cur_lr:.1e}"
+        )
 
     writer.close()
-    return model.best_map
+    return raw_model.best_map
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +333,10 @@ def eval_frame(opt, model, dataset):
     n_class  = opt['num_of_class']
     eval_cls_fn = AdaptiveFocalLoss(num_classes=n_class).cuda()
 
-    for n_iter, (input_data, cls_label, reg_label, _) in enumerate(test_loader):
+    eval_bar = tqdm(test_loader, desc="  Eval ", leave=True,
+                    bar_format="{l_bar}{bar:30}{r_bar}")
+
+    for n_iter, (input_data, cls_label, reg_label, _) in enumerate(eval_bar):
         with torch.no_grad():
             act_cls, act_reg, _ = model(input_data.cuda())
 
@@ -277,6 +358,8 @@ def eval_frame(opt, model, dataset):
             output_reg[video_name].append(act_reg[b].detach().cpu().numpy())
             labels_cls[video_name].append(cls_label[b].numpy())
             labels_reg[video_name].append(reg_label[b].numpy())
+
+        eval_bar.set_postfix(loss=f"{cost.item():.4f}")
 
     end_time = time.time()
     working_time = end_time - start_time
@@ -321,11 +404,11 @@ def eval_map_nms(opt, dataset, output_cls, output_reg, labels_cls, labels_reg):
                 st     = ed - length
                 for label in cls:
                     prop_list.append({
-                        'segment': [st * frame_to_time / 100.0,
-                                    ed * frame_to_time / 100.0],
+                        'segment': [float(st * frame_to_time / 100.0),
+                                    float(ed * frame_to_time / 100.0)],
                         'score':   float(cls_anc[anc_idx][label]),
-                        'label':   dataset.label_name[label],
-                        'gentime': idx * frame_to_time / 100.0,
+                        'label':   dataset.label_name[int(label)],
+                        'gentime': float(idx * frame_to_time / 100.0),
                     })
 
             proposal_dict += prop_list
@@ -373,11 +456,11 @@ def eval_map_supnet(opt, dataset, output_cls, output_reg, labels_cls, labels_reg
                 st     = ed - length
                 for label in cls:
                     prop_list.append({
-                        'segment': [st * frame_to_time / 100.0,
-                                    ed * frame_to_time / 100.0],
+                        'segment': [float(st * frame_to_time / 100.0),
+                                    float(ed * frame_to_time / 100.0)],
                         'score':   float(cls_anc[anc_idx][label]),
-                        'label':   dataset.label_name[label],
-                        'gentime': idx * frame_to_time / 100.0,
+                        'label':   dataset.label_name[int(label)],
+                        'gentime': float(idx * frame_to_time / 100.0),
                     })
 
             prop_list = non_max_suppression(prop_list, overlapThresh=opt['soft_nms'])
@@ -461,7 +544,7 @@ def test(opt):
     output_dict = {"version": "VERSION 1.3", "results": result_dict,
                    "external_data": {}}
     with open(opt['result_file'], 'w') as f:
-        json.dump(output_dict, f, indent=2)
+        json.dump(output_dict, f, indent=2, cls=_NumpyEncoder)
     evaluation_detection(opt)
 
 
@@ -521,11 +604,11 @@ def test_online(opt):
                 st     = ed - length
                 for label in cls:
                     prop_list.append({
-                        'segment': [st * frame_to_time / 100.0,
-                                    ed * frame_to_time / 100.0],
+                        'segment': [float(st * frame_to_time / 100.0),
+                                    float(ed * frame_to_time / 100.0)],
                         'score':   float(cls_anc[anc_idx][label]),
-                        'label':   dataset.label_name[label],
-                        'gentime': idx * frame_to_time / 100.0,
+                        'label':   dataset.label_name[int(label)],
+                        'gentime': float(idx * frame_to_time / 100.0),
                     })
 
             prop_list = non_max_suppression(prop_list, overlapThresh=opt['soft_nms'])
@@ -558,7 +641,7 @@ def test_online(opt):
     output_dict = {"version": "VERSION 1.3", "results": result_dict,
                    "external_data": {}}
     with open(opt['result_file'], 'w') as f:
-        json.dump(output_dict, f, indent=2)
+        json.dump(output_dict, f, indent=2, cls=_NumpyEncoder)
     evaluation_detection(opt)
 
 

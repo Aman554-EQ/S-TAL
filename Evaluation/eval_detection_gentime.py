@@ -246,12 +246,12 @@ def compute_average_precision_detection(ground_truth, prediction, tiou_threshold
 
     for tidx in range(len(tiou_thresholds)):
         # Computing prec-rec
-        this_tp = np.cumsum(tp[tidx,:]).astype(np.float)
-        this_fp = np.cumsum(fp[tidx,:]).astype(np.float)
+        this_tp = np.cumsum(tp[tidx,:]).astype(float)
+        this_fp = np.cumsum(fp[tidx,:]).astype(float)
         rec = this_tp / npos
         prec = this_tp / (this_tp + this_fp)
         ap[tidx] = interpolated_prec_rec(prec, rec)
-        this_tdiff=np.cumsum(timediff[tidx,:]).astype(np.float)
+        this_tdiff=np.cumsum(timediff[tidx,:]).astype(float)
         if len(this_tdiff)==0:
             continue
         tdiff[tidx]=this_tdiff[-1]#  / max(1,this_tp[-1])
