@@ -154,7 +154,7 @@ class ANETdetection(object):
                 
         sum_tdiff = np.sum(tdiff, axis=1)
         total_tp = np.sum(cnt_tp, axis=1)
-        final_tdiff = sum_tdiff/total_tp
+        final_tdiff = np.divide(sum_tdiff, total_tp, out=np.zeros_like(sum_tdiff), where=total_tp!=0)
         
         return ap, final_tdiff
 

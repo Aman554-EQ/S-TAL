@@ -76,8 +76,9 @@ class AdaptiveFocalLoss(nn.Module):
         softmax    = nn.Softmax(dim=1)
 
         p   = softmax(logits)
+        p_clamped = p.clamp(min=1e-8, max=1.0 - 1e-8)
         loss = torch.sum(
-            -targets_norm * (1.0 - p) ** gamma * logsoftmax(logits),
+            -targets_norm * (1.0 - p_clamped) ** gamma * logsoftmax(logits),
             dim=1
         )
         return loss.mean() if self.reduce else loss
@@ -104,11 +105,11 @@ def diou_loss_1d(
     # Recover interval endpoints from OAT-style regression
     # (anchor cancels in IoU computation → keep relative)
     pred_ed  = pred[:, 0]
-    pred_len = torch.exp(pred[:, 1]).clamp(min=eps)
+    pred_len = torch.exp(pred[:, 1].clamp(max=16.0)).clamp(min=eps)
     pred_st  = pred_ed - pred_len
 
     tgt_ed  = target[:, 0]
-    tgt_len = torch.exp(target[:, 1]).clamp(min=eps)
+    tgt_len = torch.exp(target[:, 1].clamp(max=16.0)).clamp(min=eps)
     tgt_st  = tgt_ed - tgt_len
 
     # Intersection
