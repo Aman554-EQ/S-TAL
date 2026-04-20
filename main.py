@@ -127,8 +127,11 @@ def train_one_epoch(opt, model, train_dataset, optimizer,
     epoch_cost_snip = 0.0
     total_iter = max(1, len(train_dataset) // opt['batch_size'])
 
-    pbar = tqdm(train_loader, desc="  Train", leave=True,
-                bar_format="{l_bar}{bar:30}{r_bar}")
+    # pbar = tqdm(train_loader, desc="  Train", leave=True,
+    #             bar_format="{l_bar}{bar:30}{r_bar}")
+    pbar = tqdm(train_loader, desc="  Train", leave=False,
+            dynamic_ncols=True, mininterval=1.0,
+            bar_format="{l_bar}{bar:30}{r_bar}")
 
     for n_iter, (input_data, cls_label, reg_label, snip_label) in enumerate(pbar):
         if warmup:
@@ -333,9 +336,12 @@ def eval_frame(opt, model, dataset):
     n_class  = opt['num_of_class']
     eval_cls_fn = AdaptiveFocalLoss(num_classes=n_class).cuda()
 
-    eval_bar = tqdm(test_loader, desc="  Eval ", leave=True,
-                    bar_format="{l_bar}{bar:30}{r_bar}")
-
+    # eval_bar = tqdm(test_loader, desc="  Eval ", leave=True,
+    #                 bar_format="{l_bar}{bar:30}{r_bar}")
+    eval_bar = tqdm(test_loader, desc="  Eval ", leave=False,
+                dynamic_ncols=True, mininterval=1.0,
+                bar_format="{l_bar}{bar:30}{r_bar}")
+    
     for n_iter, (input_data, cls_label, reg_label, _) in enumerate(eval_bar):
         with torch.no_grad():
             act_cls, act_reg, _ = model(input_data.cuda())
