@@ -54,6 +54,7 @@ class AdaptiveFocalLoss(nn.Module):
         self.pos_grad += pos_g
         self.neg_grad += neg_g
         ratio = self.pos_grad / (self.neg_grad + 1e-10)
+        ratio = torch.nan_to_num(ratio, nan=0.0, posinf=1.0, neginf=0.0)
         ratio = ratio.clamp(0, 1)
         self.pos_neg = self._map_func(ratio, s=1.0)
 
@@ -131,6 +132,7 @@ def diou_loss_1d(
     tgt_c   = 0.5 * (tgt_st  + tgt_ed)
     rho     = (pred_c - tgt_c).abs()
 
+    rho     = torch.min(rho, enc_len)
     loss = 1.0 - iou + (rho / enc_len) ** 2
 
     if reduction == 'mean':

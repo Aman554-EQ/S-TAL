@@ -108,12 +108,8 @@ import math   # required for CosineAnnealingWarmUpRestarts above
 # ---------------------------------------------------------------------------
 # Training — one epoch
 # ---------------------------------------------------------------------------
-def train_one_epoch(opt, model, train_dataset, optimizer,
-                    cls_loss_fn, snip_loss_fn, warmup=False):
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=opt['batch_size'], shuffle=True,
-        num_workers=0, pin_memory=True, drop_last=False
-    )
+def train_one_epoch(opt, model, train_loader, optimizer,
+                    cls_loss_fn, snip_loss_fn, warmup=False, pbar=None):
 
     # ── Reset ring memory at epoch start (via raw model ref) ─────────
     # Shuffled batches have no temporal continuity, so carrying memory
@@ -125,15 +121,9 @@ def train_one_epoch(opt, model, train_dataset, optimizer,
     epoch_cost_cls  = 0.0
     epoch_cost_reg  = 0.0
     epoch_cost_snip = 0.0
-    total_iter = max(1, len(train_dataset) // opt['batch_size'])
+    total_iter = max(1, len(train_loader))
 
-    # pbar = tqdm(train_loader, desc="  Train", leave=True,
-    #             bar_format="{l_bar}{bar:30}{r_bar}")
-    pbar = tqdm(train_loader, desc="  Train", leave=False,
-            dynamic_ncols=True, mininterval=1.0,
-            bar_format="{l_bar}{bar:30}{r_bar}")
-
-    for n_iter, (input_data, cls_label, reg_label, snip_label) in enumerate(pbar):
+    for n_iter, (input_data, cls_label, reg_label, snip_label) in enumerate(train_loader):
         if warmup:
             for g in optimizer.param_groups:
                 g['lr'] = (n_iter + 1) * opt['lr'] / total_iter
@@ -168,17 +158,33 @@ def train_one_epoch(opt, model, train_dataset, optimizer,
 
         optimizer.zero_grad()
         cost.backward()
+
+        # Check for NaN/Inf gradients
+        has_nan = False
+        for p in model.parameters():
+            if p.grad is not None and not torch.isfinite(p.grad).all():
+                has_nan = True
+                break
+
+        if has_nan or not torch.isfinite(cost):
+            # Skip step if NaNs exist
+            tqdm.write(f"⚠️ Warning: NaN detected at iteration {n_iter}. Skipping optimizer step.")
+            optimizer.zero_grad()
+            continue
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         # ── Real-time per-batch display ────────────────────────────────
-        pbar.set_postfix({
-            'loss': f"{cost.item():.4f}",
-            'cls':  f"{cost_cls.item():.4f}",
-            'reg':  f"{cost_reg.item():.4f}",
-            'snip': f"{cost_snip.item():.4f}",
-            'lr':   f"{optimizer.param_groups[-1]['lr']:.1e}",
-        })
+        if pbar is not None:
+            pbar.set_postfix({
+                'loss': f"{cost.item():.4f}",
+                'cls':  f"{cost_cls.item():.4f}",
+                'reg':  f"{cost_reg.item():.4f}",
+                'snip': f"{cost_snip.item():.4f}",
+                'lr':   f"{optimizer.param_groups[-1]['lr']:.1e}",
+            }, refresh=True)
+            pbar.update(1)
 
     return n_iter, epoch_cost, epoch_cost_cls, epoch_cost_reg, epoch_cost_snip
 
@@ -186,11 +192,11 @@ def train_one_epoch(opt, model, train_dataset, optimizer,
 # ---------------------------------------------------------------------------
 # Evaluation — one epoch (no grad, 3-output model)
 # ---------------------------------------------------------------------------
-def eval_one_epoch(opt, model, test_dataset):
+def eval_one_epoch(opt, model, test_dataset, test_loader=None, pbar=None):
     (cls_loss, reg_loss, tot_loss,
      output_cls, output_reg,
      labels_cls, labels_reg,
-     working_time, total_frames) = eval_frame(opt, model, test_dataset)
+     working_time, total_frames) = eval_frame(opt, model, test_dataset, test_loader, pbar)
 
     result_dict = eval_map_nms(opt, test_dataset, output_cls, output_reg,
                                 labels_cls, labels_reg)
@@ -255,18 +261,28 @@ def train(opt):
     train_dataset = VideoDataSet(opt, subset='train')
     test_dataset  = VideoDataSet(opt, subset=opt['inference_subset'])
 
-    epoch_bar = tqdm(range(opt['epoch']), desc="Epochs", unit="ep",
-                     bar_format="{l_bar}{bar:20}{r_bar}")
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=opt['batch_size'], shuffle=True,
+        num_workers=0, pin_memory=True, drop_last=False
+    )
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset, batch_size=opt['batch_size'], shuffle=False,
+        num_workers=0, pin_memory=True, drop_last=False
+    )
 
-    for n_epoch in epoch_bar:
+    import sys
+    train_pbar = tqdm(total=opt['epoch'] * len(train_loader), desc="Train", position=0, leave=True, file=sys.stdout)
+    eval_pbar = tqdm(total=opt['epoch'] * len(test_loader), desc="Eval ", position=1, leave=True, file=sys.stdout)
+
+    for n_epoch in range(opt['epoch']):
         warmup = (n_epoch == 0)
 
         # ── Train ──────────────────────────────────────────────────────
         model.train()
         (n_iter, epoch_cost, epoch_cost_cls,
          epoch_cost_reg, epoch_cost_snip) = train_one_epoch(
-            opt, model, train_dataset, optimizer,
-            cls_loss_fn, snip_loss_fn, warmup
+            opt, model, train_loader, optimizer,
+            cls_loss_fn, snip_loss_fn, warmup, pbar=train_pbar
         )
         avg_loss     = epoch_cost      / (n_iter + 1)
         avg_cls      = epoch_cost_cls  / (n_iter + 1)
@@ -281,7 +297,7 @@ def train(opt):
         model.eval()
         with torch.no_grad():
             cls_loss, reg_loss, tot_loss, IoUmAP_5 = eval_one_epoch(
-                opt, model, test_dataset
+                opt, model, test_dataset, test_loader=test_loader, pbar=eval_pbar
             )
         writer.add_scalars('data/mAP', {'test': IoUmAP_5}, n_epoch)
 
@@ -296,21 +312,23 @@ def train(opt):
             torch.save(state, opt['checkpoint_path'] + '/ckp_best.pth.tar')
 
         # ── Live summary on the epoch bar ──────────────────────────────
-        epoch_bar.set_postfix({
+        train_pbar.set_postfix({
+            'ep':    f"{n_epoch:02d}",
             'loss':  f"{avg_loss:.4f}",
             'cls':   f"{avg_cls:.4f}",
             'reg':   f"{avg_reg:.4f}",
             'snip':  f"{avg_snip:.4f}",
-            'eloss': f"{tot_loss:.4f}",
-            'mAP':   f"{IoUmAP_5:.4f}" + (" ✓best" if is_best else ""),
             'lr':    f"{cur_lr:.1e}",
-        })
-        tqdm.write(
-            f"[Epoch {n_epoch:02d}] "
-            f"train={avg_loss:.4f}  cls={avg_cls:.4f}  reg={avg_reg:.4f}  snip={avg_snip:.4f} | "
-            f"eval={tot_loss:.4f}  mAP={IoUmAP_5:.4f}{'  ← best' if is_best else ''}  lr={cur_lr:.1e}"
-        )
+        }, refresh=True)
 
+        eval_pbar.set_postfix({
+            'ep':    f"{n_epoch:02d}",
+            'loss':  f"{tot_loss:.4f}",
+            'mAP':   f"{IoUmAP_5:.4f}" + (" ✓best" if is_best else ""),
+        }, refresh=True)
+
+    train_pbar.close()
+    eval_pbar.close()
     writer.close()
     return raw_model.best_map
 
@@ -318,11 +336,12 @@ def train(opt):
 # ---------------------------------------------------------------------------
 # Frame-level evaluation (no grad)
 # ---------------------------------------------------------------------------
-def eval_frame(opt, model, dataset):
-    test_loader = torch.utils.data.DataLoader(
-        dataset, batch_size=opt['batch_size'], shuffle=False,
-        num_workers=0, pin_memory=True, drop_last=False
-    )
+def eval_frame(opt, model, dataset, test_loader=None, pbar=None):
+    if test_loader is None:
+        test_loader = torch.utils.data.DataLoader(
+            dataset, batch_size=opt['batch_size'], shuffle=False,
+            num_workers=0, pin_memory=True, drop_last=False
+        )
 
     labels_cls = {v: [] for v in dataset.video_list}
     labels_reg = {v: [] for v in dataset.video_list}
@@ -336,13 +355,9 @@ def eval_frame(opt, model, dataset):
     n_class  = opt['num_of_class']
     eval_cls_fn = AdaptiveFocalLoss(num_classes=n_class).cuda()
 
-    # eval_bar = tqdm(test_loader, desc="  Eval ", leave=True,
-    #                 bar_format="{l_bar}{bar:30}{r_bar}")
-    eval_bar = tqdm(test_loader, desc="  Eval ", leave=False,
-                dynamic_ncols=True, mininterval=1.0,
-                bar_format="{l_bar}{bar:30}{r_bar}")
-    
-    for n_iter, (input_data, cls_label, reg_label, _) in enumerate(eval_bar):
+    iterator = test_loader if pbar is not None else tqdm(test_loader, desc="  Eval ", leave=True, bar_format="{l_bar}{bar:30}{r_bar}")
+
+    for n_iter, (input_data, cls_label, reg_label, _) in enumerate(iterator):
         with torch.no_grad():
             act_cls, act_reg, _ = model(input_data.cuda())
 
@@ -365,7 +380,11 @@ def eval_frame(opt, model, dataset):
             labels_cls[video_name].append(cls_label[b].numpy())
             labels_reg[video_name].append(reg_label[b].numpy())
 
-        eval_bar.set_postfix(loss=f"{cost.item():.4f}")
+        if pbar is not None:
+            pbar.set_postfix(loss=f"{cost.item():.4f}", refresh=True)
+            pbar.update(1)
+        else:
+            iterator.set_postfix(loss=f"{cost.item():.4f}")
 
     end_time = time.time()
     working_time = end_time - start_time
