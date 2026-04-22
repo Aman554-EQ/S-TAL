@@ -14,7 +14,7 @@ from eval import evaluation_detection
 from tensorboardX import SummaryWriter
 from dataset import VideoDataSet, SuppressDataSet
 from models import MYNET, SuppressNet
-from loss_func import cls_loss_func, regress_loss_func, suppress_loss_func
+from loss_func import AdaptiveFocalLoss, cls_loss_func, regress_loss_func, suppress_loss_func
 
 def train_one_epoch(opt, model, train_dataset, optimizer):
     train_loader = torch.utils.data.DataLoader(train_dataset,
@@ -108,13 +108,17 @@ def eval_frame(opt, model, dataset):
     epoch_cost_cls = 0
     epoch_cost_reg = 0   
     
-    for n_iter,(input_data,cls_label,reg_label) in enumerate(test_loader):
-        act_cls, act_reg = model(input_data.cuda())
+    n_class  = opt['num_of_class']
+    eval_cls_fn = AdaptiveFocalLoss(num_classes=n_class).cuda()
+
+    for n_iter,(input_data,cls_label,reg_label,_) in enumerate(test_loader):
+        with torch.no_grad():
+            act_cls, act_reg, _ = model(input_data.cuda())
         
         cost_reg = 0
         cost_cls = 0
         
-        loss = cls_loss_func(cls_label,act_cls)
+        loss = cls_loss_func(cls_label, act_cls, loss_fn=eval_cls_fn)
         cost_cls = loss
             
         epoch_cost_cls+= cost_cls.detach().cpu().numpy()    

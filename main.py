@@ -1,10 +1,14 @@
 import os
 import json
+import math
 import torch
 import torchvision
 import torch.nn.parallel
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 import numpy as np
 import opts_thumos as opts
 import time
@@ -48,6 +52,41 @@ class _NumpyEncoder(json.JSONEncoder):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
         return super().default(obj)
+
+
+# ---------------------------------------------------------------------------
+# DDP helpers
+# ---------------------------------------------------------------------------
+def is_main_process():
+    """True if this is rank 0 (or DDP is not being used)."""
+    if not dist.is_available() or not dist.is_initialized():
+        return True
+    return dist.get_rank() == 0
+
+
+def get_rank():
+    if not dist.is_available() or not dist.is_initialized():
+        return 0
+    return dist.get_rank()
+
+
+def get_world_size():
+    if not dist.is_available() or not dist.is_initialized():
+        return 1
+    return dist.get_world_size()
+
+
+def setup_ddp():
+    """Initialise the default process group for DDP."""
+    dist.init_process_group(backend='nccl')
+    local_rank = int(os.environ['LOCAL_RANK'])
+    torch.cuda.set_device(local_rank)
+    return local_rank
+
+
+def cleanup_ddp():
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 # ---------------------------------------------------------------------------
@@ -95,67 +134,78 @@ class CosineAnnealingWarmUpRestarts(torch.optim.lr_scheduler._LRScheduler):
             epoch = self.last_epoch + 1
         self.T_cur = epoch
         if self.T_cur >= self.T_0:
-            self.cycle += 1
-            self.T_cur  = self.T_cur - self.T_0
+            self.cycle  += 1
+            self.T_cur   = self.T_cur - self.T_0
             self.eta_max = self.eta_max * self.gamma
         self.last_epoch = math.floor(epoch)
         for param_group, lr in zip(self.optimizer.param_groups, self.get_lr()):
             param_group['lr'] = lr
-
-import math   # required for CosineAnnealingWarmUpRestarts above
 
 
 # ---------------------------------------------------------------------------
 # Training — one epoch
 # ---------------------------------------------------------------------------
 def train_one_epoch(opt, model, train_dataset, optimizer,
-                    cls_loss_fn, snip_loss_fn, warmup=False):
+                    cls_loss_fn, snip_loss_fn,
+                    warmup=False, sampler=None):
+
+    # Shuffle sampler for DDP; standard DataLoader shuffle otherwise
+    use_ddp = dist.is_available() and dist.is_initialized()
+    num_workers = opt.get('num_workers', 8)
+
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=opt['batch_size'], shuffle=True,
-        num_workers=0, pin_memory=True, drop_last=False
+        train_dataset,
+        batch_size=opt['batch_size'],
+        shuffle=(sampler is None),       # shuffle only when no sampler
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=4 if num_workers > 0 else None,
     )
 
-    # ── Reset ring memory at epoch start (via raw model ref) ─────────
-    # Shuffled batches have no temporal continuity, so carrying memory
-    # across epochs is semantically wrong and causes batch-size crashes.
-    raw = model.module if isinstance(model, torch.nn.DataParallel) else model
+    # ── Reset ring memory at epoch start ─────────────────────────────────
+    raw = model.module if hasattr(model, 'module') else model
     raw.ring_memory.queue     = None
     raw.ring_memory.cur_video = None
+
     epoch_cost      = 0.0
     epoch_cost_cls  = 0.0
     epoch_cost_reg  = 0.0
     epoch_cost_snip = 0.0
     total_iter = max(1, len(train_dataset) // opt['batch_size'])
 
-    # pbar = tqdm(train_loader, desc="  Train", leave=True,
-    #             bar_format="{l_bar}{bar:30}{r_bar}")
     pbar = tqdm(train_loader, desc="  Train", leave=False,
-            dynamic_ncols=True, mininterval=1.0,
-            bar_format="{l_bar}{bar:30}{r_bar}")
+                dynamic_ncols=True, mininterval=1.0,
+                bar_format="{l_bar}{bar:30}{r_bar}",
+                disable=not is_main_process())
 
     for n_iter, (input_data, cls_label, reg_label, snip_label) in enumerate(pbar):
         if warmup:
             for g in optimizer.param_groups:
                 g['lr'] = (n_iter + 1) * opt['lr'] / total_iter
 
-        # Forward (3 outputs)
-        act_cls, act_reg, snip_cls = model(input_data.cuda())
+        input_data = input_data.cuda(non_blocking=True)
 
-        # ── Register gradient hooks for adaptive focal loss ────────────
+        # Forward (3 outputs)
+        act_cls, act_reg, snip_cls = model(input_data)
+
+        # ── Register gradient hooks for adaptive focal loss ───────────
         act_cls.register_hook(partial(cls_loss_fn.collect_grad,  cls_label))
         snip_cls.register_hook(partial(snip_loss_fn.collect_grad, snip_label))
 
-        # ── Classification loss ────────────────────────────────────────
+        # ── Classification loss ───────────────────────────────────────
         cost_cls  = cls_loss_func(cls_label, act_cls, loss_fn=cls_loss_fn)
         epoch_cost_cls += cost_cls.detach().cpu().item()
 
-        # ── Regression loss (L1 + DIoU) ───────────────────────────────
+        # ── Regression loss (L1 + DIoU) ──────────────────────────────
         cost_reg  = regress_loss_func(reg_label, act_reg,
                                       use_diou=opt.get('use_diou', True),
                                       diou_weight=opt.get('diou_weight', 1.0))
         epoch_cost_reg += cost_reg.detach().cpu().item()
 
-        # ── Snippet classification loss (auxiliary) ────────────────────
+        # ── Snippet classification loss (auxiliary) ───────────────────
         cost_snip = cls_loss_func(snip_label, snip_cls,
                                   loss_fn=snip_loss_fn)
         epoch_cost_snip += cost_snip.detach().cpu().item()
@@ -171,14 +221,14 @@ def train_one_epoch(opt, model, train_dataset, optimizer,
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        # ── Real-time per-batch display ────────────────────────────────
-        pbar.set_postfix({
-            'loss': f"{cost.item():.4f}",
-            'cls':  f"{cost_cls.item():.4f}",
-            'reg':  f"{cost_reg.item():.4f}",
-            'snip': f"{cost_snip.item():.4f}",
-            'lr':   f"{optimizer.param_groups[-1]['lr']:.1e}",
-        })
+        if is_main_process():
+            pbar.set_postfix({
+                'loss': f"{cost.item():.4f}",
+                'cls':  f"{cost_cls.item():.4f}",
+                'reg':  f"{cost_reg.item():.4f}",
+                'snip': f"{cost_snip.item():.4f}",
+                'lr':   f"{optimizer.param_groups[-1]['lr']:.1e}",
+            })
 
     return n_iter, epoch_cost, epoch_cost_cls, epoch_cost_reg, epoch_cost_snip
 
@@ -199,7 +249,7 @@ def eval_one_epoch(opt, model, test_dataset):
     with open(opt['result_file'], 'w') as f:
         json.dump(output_dict, f, indent=2, cls=_NumpyEncoder)
 
-    IoUmAP  = evaluation_detection(opt, verbose=False)
+    IoUmAP   = evaluation_detection(opt, verbose=False)
     IoUmAP_5 = sum(IoUmAP) / len(IoUmAP)
     return cls_loss, reg_loss, tot_loss, IoUmAP_5
 
@@ -208,22 +258,42 @@ def eval_one_epoch(opt, model, test_dataset):
 # Main training loop
 # ---------------------------------------------------------------------------
 def train(opt):
-    writer = SummaryWriter()
+    # ── DDP vs single-GPU setup ────────────────────────────────────────
+    use_ddp = 'LOCAL_RANK' in os.environ
 
-    # ── Build model, optionally wrap with DataParallel ─────────────────
-    _n_gpus = torch.cuda.device_count()
-    raw_model = MYNET(opt).cuda()          # always keep the unwrapped ref
-    if _n_gpus > 1:
-        tqdm.write(f"\n🚀  Using {_n_gpus} GPUs with nn.DataParallel")
-        model = torch.nn.DataParallel(raw_model)
-        # Double batch size to fully utilise both GPUs
-        opt = dict(opt)                    # shallow copy so original unchanged
-        opt['batch_size'] = opt['batch_size'] * _n_gpus
+    if use_ddp:
+        local_rank = setup_ddp()
+        device = torch.device(f'cuda:{local_rank}')
+        if is_main_process():
+            tqdm.write(f"\n🚀  DDP — rank {local_rank} / {get_world_size()} GPUs")
     else:
-        tqdm.write("\nℹ️  Single GPU detected")
+        _n_gpus = torch.cuda.device_count()
+        local_rank = 0
+        device = torch.device('cuda:0')
+        if _n_gpus > 1:
+            tqdm.write(f"\n⚠️  {_n_gpus} GPUs found but launched without torchrun.")
+            tqdm.write("    For best performance run:")
+            tqdm.write("    torchrun --nproc_per_node=2 main.py [args]")
+            tqdm.write("    Falling back to DataParallel for now.\n")
+        else:
+            tqdm.write("\nℹ️  Single GPU detected")
+
+    writer = SummaryWriter() if is_main_process() else None
+
+    # ── Build model ───────────────────────────────────────────────────
+    raw_model = MYNET(opt).to(device)
+
+    if use_ddp:
+        model = DDP(raw_model, device_ids=[local_rank],
+                    output_device=local_rank, find_unused_parameters=False)
+    elif torch.cuda.device_count() > 1:
+        model = torch.nn.DataParallel(raw_model)
+        opt   = dict(opt)
+        opt['batch_size'] = opt['batch_size'] * torch.cuda.device_count()
+    else:
         model = raw_model
 
-    # ── Differential LR: history unit gets a much lower LR ────────────
+    # ── Differential LR: history unit gets a much lower LR ───────────
     hist_params  = list(raw_model.history_unit.parameters())
     hist_ids     = set(id(p) for p in hist_params)
     other_params = [p for p in raw_model.parameters() if id(p) not in hist_ids]
@@ -233,7 +303,7 @@ def train(opt):
         {'params': other_params}
     ], lr=opt['lr'], weight_decay=opt['weight_decay'])
 
-    # ── Scheduler: cosine warm-up restarts (MATR) or step (OAT) ───────
+    # ── Scheduler ────────────────────────────────────────────────────
     if opt.get('use_cosine_lr', True):
         scheduler = CosineAnnealingWarmUpRestarts(
             optimizer,
@@ -247,71 +317,97 @@ def train(opt):
             optimizer, step_size=opt['lr_step']
         )
 
-    # ── Adaptive focal loss objects (shared across iterations) ─────────
-    n_class   = opt['num_of_class']
-    cls_loss_fn  = AdaptiveFocalLoss(num_classes=n_class).cuda()
-    snip_loss_fn = AdaptiveFocalLoss(num_classes=n_class).cuda()
+    # ── Adaptive focal loss objects ───────────────────────────────────
+    n_class      = opt['num_of_class']
+    cls_loss_fn  = AdaptiveFocalLoss(num_classes=n_class).to(device)
+    snip_loss_fn = AdaptiveFocalLoss(num_classes=n_class).to(device)
 
     train_dataset = VideoDataSet(opt, subset='train')
     test_dataset  = VideoDataSet(opt, subset=opt['inference_subset'])
 
+    # ── DDP sampler (ensures each rank sees a different shard) ────────
+    train_sampler = (DistributedSampler(train_dataset,
+                                        num_replicas=get_world_size(),
+                                        rank=get_rank(),
+                                        shuffle=True)
+                     if use_ddp else None)
+
     epoch_bar = tqdm(range(opt['epoch']), desc="Epochs", unit="ep",
-                     bar_format="{l_bar}{bar:20}{r_bar}")
+                     bar_format="{l_bar}{bar:20}{r_bar}",
+                     disable=not is_main_process())
 
     for n_epoch in epoch_bar:
         warmup = (n_epoch == 0)
 
-        # ── Train ──────────────────────────────────────────────────────
+        # DDP sampler must be told the epoch so shuffling differs each time
+        if train_sampler is not None:
+            train_sampler.set_epoch(n_epoch)
+
+        # ── Train ─────────────────────────────────────────────────────
         model.train()
         (n_iter, epoch_cost, epoch_cost_cls,
          epoch_cost_reg, epoch_cost_snip) = train_one_epoch(
             opt, model, train_dataset, optimizer,
-            cls_loss_fn, snip_loss_fn, warmup
+            cls_loss_fn, snip_loss_fn,
+            warmup=warmup, sampler=train_sampler
         )
-        avg_loss     = epoch_cost      / (n_iter + 1)
-        avg_cls      = epoch_cost_cls  / (n_iter + 1)
-        avg_reg      = epoch_cost_reg  / (n_iter + 1)
-        avg_snip     = epoch_cost_snip / (n_iter + 1)
-        cur_lr       = optimizer.param_groups[-1]['lr']
 
-        writer.add_scalars('data/cost', {'train': avg_loss}, n_epoch)
+        avg_loss = epoch_cost      / (n_iter + 1)
+        avg_cls  = epoch_cost_cls  / (n_iter + 1)
+        avg_reg  = epoch_cost_reg  / (n_iter + 1)
+        avg_snip = epoch_cost_snip / (n_iter + 1)
+        cur_lr   = optimizer.param_groups[-1]['lr']
 
-        # ── Eval ───────────────────────────────────────────────────────
+        if writer:
+            writer.add_scalars('data/cost', {'train': avg_loss}, n_epoch)
+
+        # ── Eval (only on rank 0 to avoid duplicate JSON writes) ──────
         scheduler.step()
-        model.eval()
-        with torch.no_grad():
-            cls_loss, reg_loss, tot_loss, IoUmAP_5 = eval_one_epoch(
-                opt, model, test_dataset
+        IoUmAP_5 = 0.0
+        if is_main_process():
+            model.eval()
+            with torch.no_grad():
+                cls_loss, reg_loss, tot_loss, IoUmAP_5 = eval_one_epoch(
+                    opt, model, test_dataset
+                )
+            if writer:
+                writer.add_scalars('data/mAP', {'test': IoUmAP_5}, n_epoch)
+
+        # Broadcast best mAP to all ranks so checkpoint logic is consistent
+        if use_ddp:
+            t = torch.tensor([IoUmAP_5], device=device)
+            dist.broadcast(t, src=0)
+            IoUmAP_5 = t.item()
+
+        # ── Checkpoint (rank 0 only) ───────────────────────────────────
+        if is_main_process():
+            state   = {'epoch': n_epoch + 1, 'state_dict': raw_model.state_dict()}
+            torch.save(state, opt['checkpoint_path'] + '/checkpoint.pth.tar')
+            is_best = IoUmAP_5 > raw_model.best_map
+            if is_best:
+                raw_model.best_map = IoUmAP_5
+                torch.save(state, opt['checkpoint_path'] + '/ckp_best.pth.tar')
+
+            epoch_bar.set_postfix({
+                'loss':  f"{avg_loss:.4f}",
+                'cls':   f"{avg_cls:.4f}",
+                'reg':   f"{avg_reg:.4f}",
+                'snip':  f"{avg_snip:.4f}",
+                'eloss': f"{tot_loss:.4f}",
+                'mAP':   f"{IoUmAP_5:.4f}" + (" ✓best" if is_best else ""),
+                'lr':    f"{cur_lr:.1e}",
+            })
+            tqdm.write(
+                f"[Epoch {n_epoch:02d}] "
+                f"train={avg_loss:.4f}  cls={avg_cls:.4f}  reg={avg_reg:.4f}  snip={avg_snip:.4f} | "
+                f"eval={tot_loss:.4f}  mAP={IoUmAP_5:.4f}"
+                f"{'  ← best' if is_best else ''}  lr={cur_lr:.1e}"
             )
-        writer.add_scalars('data/mAP', {'test': IoUmAP_5}, n_epoch)
 
-        # ── Checkpoint ─────────────────────────────────────────────────
-        # Always save raw_model.state_dict() — no 'module.' prefix,
-        # so checkpoints load cleanly on any number of GPUs.
-        state = {'epoch': n_epoch + 1, 'state_dict': raw_model.state_dict()}
-        torch.save(state, opt['checkpoint_path'] + '/checkpoint.pth.tar')
-        is_best = IoUmAP_5 > raw_model.best_map
-        if is_best:
-            raw_model.best_map = IoUmAP_5
-            torch.save(state, opt['checkpoint_path'] + '/ckp_best.pth.tar')
+    if writer:
+        writer.close()
 
-        # ── Live summary on the epoch bar ──────────────────────────────
-        epoch_bar.set_postfix({
-            'loss':  f"{avg_loss:.4f}",
-            'cls':   f"{avg_cls:.4f}",
-            'reg':   f"{avg_reg:.4f}",
-            'snip':  f"{avg_snip:.4f}",
-            'eloss': f"{tot_loss:.4f}",
-            'mAP':   f"{IoUmAP_5:.4f}" + (" ✓best" if is_best else ""),
-            'lr':    f"{cur_lr:.1e}",
-        })
-        tqdm.write(
-            f"[Epoch {n_epoch:02d}] "
-            f"train={avg_loss:.4f}  cls={avg_cls:.4f}  reg={avg_reg:.4f}  snip={avg_snip:.4f} | "
-            f"eval={tot_loss:.4f}  mAP={IoUmAP_5:.4f}{'  ← best' if is_best else ''}  lr={cur_lr:.1e}"
-        )
-
-    writer.close()
+    cleanup_ddp()
     return raw_model.best_map
 
 
@@ -319,9 +415,16 @@ def train(opt):
 # Frame-level evaluation (no grad)
 # ---------------------------------------------------------------------------
 def eval_frame(opt, model, dataset):
+    num_workers = opt.get('num_workers', 8)
     test_loader = torch.utils.data.DataLoader(
-        dataset, batch_size=opt['batch_size'], shuffle=False,
-        num_workers=0, pin_memory=True, drop_last=False
+        dataset,
+        batch_size=opt['batch_size'],
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=4 if num_workers > 0 else None,
     )
 
     labels_cls = {v: [] for v in dataset.video_list}
@@ -329,22 +432,22 @@ def eval_frame(opt, model, dataset):
     output_cls  = {v: [] for v in dataset.video_list}
     output_reg  = {v: [] for v in dataset.video_list}
 
-    start_time = time.time()
+    start_time   = time.time()
     total_frames = 0
     epoch_cost = epoch_cost_cls = epoch_cost_reg = 0.0
 
-    n_class  = opt['num_of_class']
+    n_class     = opt['num_of_class']
     eval_cls_fn = AdaptiveFocalLoss(num_classes=n_class).cuda()
 
-    # eval_bar = tqdm(test_loader, desc="  Eval ", leave=True,
-    #                 bar_format="{l_bar}{bar:30}{r_bar}")
     eval_bar = tqdm(test_loader, desc="  Eval ", leave=False,
-                dynamic_ncols=True, mininterval=1.0,
-                bar_format="{l_bar}{bar:30}{r_bar}")
-    
+                    dynamic_ncols=True, mininterval=1.0,
+                    bar_format="{l_bar}{bar:30}{r_bar}",
+                    disable=not is_main_process())
+
     for n_iter, (input_data, cls_label, reg_label, _) in enumerate(eval_bar):
+        input_data = input_data.cuda(non_blocking=True)
         with torch.no_grad():
-            act_cls, act_reg, _ = model(input_data.cuda())
+            act_cls, act_reg, _ = model(input_data)
 
         cost_cls = cls_loss_func(cls_label, act_cls, loss_fn=eval_cls_fn)
         cost_reg = regress_loss_func(reg_label, act_reg,
@@ -355,26 +458,31 @@ def eval_frame(opt, model, dataset):
         epoch_cost_reg += cost_reg.detach().cpu().item()
         epoch_cost     += cost.detach().cpu().item()
 
-        act_cls = torch.softmax(act_cls, dim=-1)
+        act_cls      = torch.softmax(act_cls, dim=-1)
         total_frames += input_data.size(0)
 
         for b in range(input_data.size(0)):
-            video_name, st, ed, data_idx = dataset.inputs[n_iter * opt['batch_size'] + b]
+            idx = n_iter * opt['batch_size'] + b
+            if idx >= len(dataset.inputs):
+                break
+            video_name, st, ed, data_idx = dataset.inputs[idx]
             output_cls[video_name].append(act_cls[b].detach().cpu().numpy())
             output_reg[video_name].append(act_reg[b].detach().cpu().numpy())
             labels_cls[video_name].append(cls_label[b].numpy())
             labels_reg[video_name].append(reg_label[b].numpy())
 
-        eval_bar.set_postfix(loss=f"{cost.item():.4f}")
+        if is_main_process():
+            eval_bar.set_postfix(loss=f"{cost.item():.4f}")
 
-    end_time = time.time()
+    end_time     = time.time()
     working_time = end_time - start_time
 
     for v in dataset.video_list:
-        labels_cls[v] = np.stack(labels_cls[v], axis=0)
-        labels_reg[v] = np.stack(labels_reg[v], axis=0)
-        output_cls[v] = np.stack(output_cls[v], axis=0)
-        output_reg[v] = np.stack(output_reg[v], axis=0)
+        if labels_cls[v]:
+            labels_cls[v] = np.stack(labels_cls[v], axis=0)
+            labels_reg[v] = np.stack(labels_reg[v], axis=0)
+            output_cls[v] = np.stack(output_cls[v], axis=0)
+            output_reg[v] = np.stack(output_reg[v], axis=0)
 
     n = max(1, n_iter)
     return (epoch_cost_cls / n, epoch_cost_reg / n, epoch_cost / n,
@@ -383,7 +491,7 @@ def eval_frame(opt, model, dataset):
 
 
 # ---------------------------------------------------------------------------
-# NMS-based proposal generation (unchanged logic from OAT)
+# NMS-based proposal generation
 # ---------------------------------------------------------------------------
 def eval_map_nms(opt, dataset, output_cls, output_reg, labels_cls, labels_reg):
     result_dict   = {}
@@ -401,7 +509,6 @@ def eval_map_nms(opt, dataset, output_cls, output_reg, labels_cls, labels_reg):
 
             prop_list = []
             for anc_idx, anc in enumerate(anchors):
-                # classes above threshold (exclude background = last)
                 cls = np.argwhere(cls_anc[anc_idx][:-1] > opt['threshold']).reshape(-1)
                 if len(cls) == 0:
                     continue
@@ -428,7 +535,7 @@ def eval_map_nms(opt, dataset, output_cls, output_reg, labels_cls, labels_reg):
 
 
 # ---------------------------------------------------------------------------
-# SuppressNet-based post-processing (unchanged logic from OAT)
+# SuppressNet-based post-processing
 # ---------------------------------------------------------------------------
 def eval_map_supnet(opt, dataset, output_cls, output_reg, labels_cls, labels_reg):
     model = SuppressNet(opt).cuda()
@@ -471,8 +578,9 @@ def eval_map_supnet(opt, dataset, output_cls, output_reg, labels_cls, labels_reg
 
             prop_list = non_max_suppression(prop_list, overlapThresh=opt['soft_nms'])
 
-            conf_queue[:-1, :] = conf_queue[1:, :].clone()
-            conf_queue[-1, :]  = 0
+            # ── Use torch.roll for O(1) queue shift ───────────────────
+            conf_queue = torch.roll(conf_queue, -1, dims=0)
+            conf_queue[-1, :] = 0
             for proposal in prop_list:
                 cidx = dataset.label_name.index(proposal['label'])
                 conf_queue[-1, cidx] = proposal['score']
@@ -514,10 +622,10 @@ def test_frame(opt):
 
     print("test loss: %.4f  cls: %.4f  reg: %.4f" % (tot_loss, cls_loss, reg_loss))
     for vn in dataset.video_list:
-        for key, arr in [('pred_cls', output_cls[vn]),
-                         ('pred_reg', output_reg[vn]),
-                         ('label_cls', labels_cls[vn]),
-                         ('label_reg', labels_reg[vn])]:
+        for key, arr in [('pred_cls',   output_cls[vn]),
+                         ('pred_reg',   output_reg[vn]),
+                         ('label_cls',  labels_cls[vn]),
+                         ('label_reg',  labels_reg[vn])]:
             ds = outfile.create_dataset(vn + '/' + key, arr.shape,
                                         maxshape=arr.shape, chunks=True,
                                         dtype=np.float32)
@@ -560,7 +668,7 @@ def test_online(opt):
     ckp   = torch.load(opt['checkpoint_path'] + '/ckp_best.pth.tar')
     model.load_state_dict(ckp['state_dict'])
     model.eval()
-    model.reset_memory()   # ← flush ring buffer
+    model.reset_memory()
 
     sup_model = SuppressNet(opt).cuda()
     ckp_sup   = torch.load(opt['checkpoint_path'] + '/ckp_best_suppress.pth.tar')
@@ -572,12 +680,12 @@ def test_online(opt):
     unit_size = opt['segment_size']
     anchors   = opt['anchors']
 
-    result_dict   = {}
-    start_time    = time.time()
-    total_frames  = 0
+    result_dict  = {}
+    start_time   = time.time()
+    total_frames = 0
 
     for video_name in dataset.video_list:
-        model.reset_memory()   # reset memory at video boundary
+        model.reset_memory()
         input_queue = torch.zeros((unit_size, opt['feat_dim']))
         sup_queue   = torch.zeros((unit_size, num_class - 1))
         proposal_dict = []
@@ -588,8 +696,10 @@ def test_online(opt):
 
         for idx in range(duration):
             total_frames += 1
-            input_queue[:-1, :] = input_queue[1:, :].clone()
-            input_queue[-1:, :] = dataset._get_base_data(video_name, idx, idx + 1)
+
+            # ── O(1) roll instead of clone-shift ─────────────────────
+            input_queue = torch.roll(input_queue, -1, dims=0)
+            input_queue[-1, :] = dataset._get_base_data(video_name, idx, idx + 1)
 
             minput = input_queue.unsqueeze(0)
             with torch.no_grad():
@@ -619,8 +729,9 @@ def test_online(opt):
 
             prop_list = non_max_suppression(prop_list, overlapThresh=opt['soft_nms'])
 
-            sup_queue[:-1, :] = sup_queue[1:, :].clone()
-            sup_queue[-1, :]  = 0
+            # ── O(1) roll for sup_queue ───────────────────────────────
+            sup_queue = torch.roll(sup_queue, -1, dims=0)
+            sup_queue[-1, :] = 0
             for p in prop_list:
                 cidx = dataset.label_name.index(p['label'])
                 sup_queue[-1, cidx] = p['score']
@@ -673,8 +784,11 @@ if __name__ == '__main__':
     opt = opts.parse_opt()
     opt = vars(opt)
     os.makedirs(opt['checkpoint_path'], exist_ok=True)
-    with open(opt['checkpoint_path'] + '/opts.json', 'w') as f:
-        json.dump(opt, f)
+
+    # Save opts only on rank 0 (or when not using DDP)
+    if 'LOCAL_RANK' not in os.environ or int(os.environ.get('LOCAL_RANK', 0)) == 0:
+        with open(opt['checkpoint_path'] + '/opts.json', 'w') as f:
+            json.dump(opt, f)
 
     if opt['seed'] >= 0:
         torch.manual_seed(opt['seed'])

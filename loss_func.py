@@ -32,12 +32,28 @@ class AdaptiveFocalLoss(nn.Module):
         self.register_buffer('pos_neg',  torch.ones(num_classes - 1))
 
     # ------------------------------------------------------------------
+    def reset_stats(self):
+        """Call once per epoch to clear accumulated gradient statistics.
+        Without this, pos_grad / neg_grad grow without bound and make
+        the adaptive gamma degenerate after epoch 2 (Fix #1)."""
+        self.pos_grad.zero_()
+        self.neg_grad.zero_()
+        self.pos_neg.fill_(1.0)
+
+    # ------------------------------------------------------------------
     def _map_func(self, x: torch.Tensor, s: float = 1.0) -> torch.Tensor:
         """Sigmoid-like monotone normaliser onto [0, 1]."""
         xmin, xmax = x.min(), x.max()
-        mu = x.mean()
-        x_norm = (x - xmin) / (xmax - xmin + 1e-8)
-        return 1.0 / (1.0 + torch.exp(-s * (x_norm - mu)))
+        # Fix #4: if all classes collapse to same gradient norm the range is ~0;
+        # amplifying by 1/1e-8 would push exp() arguments to ±1e8 → NaN in backward.
+        # Return a neutral 0.5 (uniform gamma adjustment) instead.
+        if (xmax - xmin).item() < 1e-6:
+            return torch.full_like(x, 0.5)
+        x_norm = (x - xmin) / (xmax - xmin)
+        mu     = x_norm.mean()
+        # Clamp the exp() argument so it never overflows to inf.
+        arg = (-s * (x_norm - mu)).clamp(min=-20.0, max=20.0)
+        return 1.0 / (1.0 + torch.exp(arg))
 
     # ------------------------------------------------------------------
     @torch.no_grad()
@@ -77,7 +93,12 @@ class AdaptiveFocalLoss(nn.Module):
         softmax    = nn.Softmax(dim=1)
 
         p   = softmax(logits)
-        p_clamped = p.clamp(min=1e-8, max=1.0 - 1e-8)
+        # Fix #6: float32 precision bug. 1.0 - 1e-8 evaluates to exactly 1.0 in float32.
+        # This makes (1.0 - p_clamped) exactly 0.0 for confident predictions.
+        # During backward, PyTorch computes 0.0 ** (gamma - 1), which is 0.0 ** -0.975 = Infinity!
+        # Multiplying Infinity by the upstream 0.0 gradient yields NaN. 
+        # Clamping to 1e-5 ensures (1.0 - p_clamped) is safely represented in float32.
+        p_clamped = p.clamp(min=1e-5, max=1.0 - 1e-5)
         loss = torch.sum(
             -targets_norm * (1.0 - p_clamped) ** gamma * logsoftmax(logits),
             dim=1
@@ -106,11 +127,13 @@ def diou_loss_1d(
     # Recover interval endpoints from OAT-style regression
     # (anchor cancels in IoU computation → keep relative)
     pred_ed  = pred[:, 0]
-    pred_len = torch.exp(pred[:, 1].clamp(max=16.0)).clamp(min=eps)
+    # Fix #3: tighter clamp on exp() input — exp(6)≈400 covers any real temporal ratio,
+    # while exp(16)=8.9M creates backward gradients of 8.9M which can cascade into NaN.
+    pred_len = torch.exp(pred[:, 1].clamp(min=-6.0, max=6.0)).clamp(min=eps)
     pred_st  = pred_ed - pred_len
 
     tgt_ed  = target[:, 0]
-    tgt_len = torch.exp(target[:, 1].clamp(max=16.0)).clamp(min=eps)
+    tgt_len = torch.exp(target[:, 1].clamp(min=-6.0, max=6.0)).clamp(min=eps)
     tgt_st  = tgt_ed - tgt_len
 
     # Intersection
@@ -145,11 +168,15 @@ def diou_loss_1d(
 # ---------------------------------------------------------------------------
 # Convenience wrappers (match existing call-sites in main.py)
 # ---------------------------------------------------------------------------
-def cls_loss_func(y, output, loss_fn=None, reduce=True):
+def cls_loss_func(y, output, loss_fn=None, reduce=True, register_hook=False):
     """
     y      : (B, A, C) or (B, C)  multi-hot labels
     output : (B, A, C) or (B, C)  logits
     loss_fn: AdaptiveFocalLoss instance (optional; created fresh if None)
+    register_hook: if True AND loss_fn is an AdaptiveFocalLoss, register
+                   collect_grad on out_flat — the tensor actually seen by
+                   the loss (Fix #2: the old code registered on the pre-reshape
+                   output, which is a different node in the autograd graph).
     """
     input_size = y.size()
     y      = y.float().cuda()
@@ -158,8 +185,14 @@ def cls_loss_func(y, output, loss_fn=None, reduce=True):
     if loss_fn is None:
         loss_fn = AdaptiveFocalLoss(num_classes=y.shape[-1], reduce=reduce).cuda()
 
-    y_flat  = y.reshape(-1, y.size(-1))
+    y_flat   = y.reshape(-1, y.size(-1))
     out_flat = output.reshape(-1, output.size(-1))
+
+    # Fix #2: hook on out_flat (post-reshape), not on the original output.
+    if register_hook and hasattr(loss_fn, 'collect_grad') and out_flat.requires_grad:
+        from functools import partial
+        out_flat.register_hook(partial(loss_fn.collect_grad, y_flat))
+
     loss = loss_fn(out_flat, y_flat)
 
     if not reduce:

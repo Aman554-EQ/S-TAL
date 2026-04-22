@@ -72,7 +72,9 @@ def parse_opt():
                         help='StepLR step size (used only when --use_cosine_lr is False).')
 
     # ── Cosine Warm-Restart LR ────────────────────────────────────────
-    parser.add_argument('--use_cosine_lr',  type=bool,  default=True)
+    # Fix #5: default is now False (StepLR) to match OAT-OSN-main exactly.
+    # Once NaN is resolved, set --use_cosine_lr True to re-enable cosine.
+    parser.add_argument('--use_cosine_lr',  type=bool,  default=False)
     parser.add_argument('--lr_T0',          type=int,   default=5,
                         help='Full cycle length (epochs) for cosine LR.')
     parser.add_argument('--lr_Tup',         type=int,   default=1,
